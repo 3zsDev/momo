@@ -1,0 +1,261 @@
+const msgpack = (() => {
+    const pow32 = 0x100000000;
+
+    function encodeUtf8(str) {
+        const encoder = new TextEncoder();
+        return encoder.encode(str);
+    }
+
+    function decodeUtf8(bytes, start = 0, length = bytes.length - start) {
+        return new TextDecoder().decode(bytes.subarray(start, start + length));
+    }
+
+    function serialize(data) {
+        let buffer = new Uint8Array(128);
+        let offset = 0;
+        const float64Buf = new DataView(new ArrayBuffer(8));
+
+        const ensure = (size) => {
+            if (buffer.length < offset + size) {
+                let newBuf = new Uint8Array(Math.max(buffer.length * 2, offset + size));
+                newBuf.set(buffer);
+                buffer = newBuf;
+            }
+        };
+
+        const write = (...bytes) => {
+            ensure(bytes.length);
+            buffer.set(bytes, offset);
+            offset += bytes.length;
+        };
+
+        const writeByte = (byte) => {
+            ensure(1);
+            buffer[offset++] = byte;
+        };
+
+        const writeInt64 = (val) => {
+            let hi, lo;
+            if (val >= 0) {
+                hi = Math.floor(val / pow32);
+                lo = val >>> 0;
+            } else {
+                let abs = -val - 1;
+                hi = Math.floor(abs / pow32);
+                lo = abs >>> 0;
+                hi = ~hi;
+                lo = ~lo >>> 0;
+            }
+            write(
+                (hi >>> 24) & 0xff, (hi >>> 16) & 0xff, (hi >>> 8) & 0xff, hi & 0xff,
+                (lo >>> 24) & 0xff, (lo >>> 16) & 0xff, (lo >>> 8) & 0xff, lo & 0xff
+            );
+        };
+
+        const encode = (val) => {
+            if (val === null || val === undefined) return writeByte(0xc0);
+            if (typeof val === "boolean") return writeByte(val ? 0xc3 : 0xc2);
+
+            if (typeof val === "number") {
+                if (Number.isInteger(val)) {
+                    if (val >= 0 && val <= 0x7f) return writeByte(val);
+                    if (val >= -32 && val < 0) return writeByte(0xe0 | (val + 32));
+                    if (val >= 0 && val <= 0xff) return write(0xcc, val);
+                    if (val >= -0x80 && val <= 0x7f) return write(0xd0, val & 0xff);
+                    if (val >= 0 && val <= 0xffff) return write(0xcd, val >>> 8, val);
+                    if (val >= -0x8000 && val <= 0x7fff) return write(0xd1, val >>> 8, val);
+                    if (val >= 0 && val <= 0xffffffff) return write(0xce, val >>> 24, val >>> 16, val >>> 8, val);
+                    if (val >= -0x80000000 && val <= 0x7fffffff) return write(0xd2, val >>> 24, val >>> 16, val >>> 8, val);
+                    // 64-bit integers
+                    if (val >= 0 && val <= Number.MAX_SAFE_INTEGER) {
+                        writeByte(0xcf);
+                        writeInt64(val);
+                        return;
+                    }
+                    if (val < 0 && val >= Number.MIN_SAFE_INTEGER) {
+                        writeByte(0xd3);
+                        writeInt64(val);
+                        return;
+                    }
+                    // overflow
+                    write(0xcf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff);
+                } else {
+                    float64Buf.setFloat64(0, val);
+                    writeByte(0xcb);
+                    write(...new Uint8Array(float64Buf.buffer));
+                }
+                return;
+            }
+
+            if (typeof val === "string") {
+                const bytes = encodeUtf8(val);
+                const len = bytes.length;
+                if (len <= 0x1f) writeByte(0xa0 + len);
+                else if (len <= 0xff) write(0xd9, len);
+                else if (len <= 0xffff) write(0xda, len >>> 8, len);
+                else write(0xdb, len >>> 24, len >>> 16, len >>> 8, len);
+                write(...bytes);
+                return;
+            }
+
+            if (val instanceof Date) {
+                let sec = Math.floor(val.getTime() / 1000);
+                let ns = (val.getTime() % 1000) * 1e6;
+                if (ns === 0 && sec < 0x100000000) {
+                    write(0xd6, 0xff, sec >>> 24, sec >>> 16, sec >>> 8, sec);
+                } else if (sec < 0x400000000) {
+                    let tmp = (ns << 2) | (sec / pow32);
+                    write(0xd7, 0xff, tmp >>> 24, tmp >>> 16, tmp >>> 8, tmp, sec >>> 24, sec >>> 16, sec >>> 8, sec);
+                } else {
+                    write(0xc7, 12, 0xff, ns >>> 24, ns >>> 16, ns >>> 8, ns);
+                    writeInt64(sec);
+                }
+                return;
+            }
+
+            if (val instanceof Uint8Array || val instanceof Uint8ClampedArray) {
+                const len = val.length;
+                if (len <= 0xff) write(0xc4, len);
+                else if (len <= 0xffff) write(0xc5, len >>> 8, len);
+                else write(0xc6, len >>> 24, len >>> 16, len >>> 8, len);
+                write(...val);
+                return;
+            }
+
+            if (Array.isArray(val)) {
+                const len = val.length;
+                if (len <= 0xf) writeByte(0x90 + len);
+                else if (len <= 0xffff) write(0xdc, len >>> 8, len);
+                else write(0xdd, len >>> 24, len >>> 16, len >>> 8, len);
+                val.forEach(encode);
+                return;
+            }
+
+            if (typeof val === "object") {
+                const keys = Object.keys(val);
+                const len = keys.length;
+                if (len <= 0xf) writeByte(0x80 + len);
+                else if (len <= 0xffff) write(0xde, len >>> 8, len);
+                else write(0xdf, len >>> 24, len >>> 16, len >>> 8, len);
+                keys.forEach(k => {
+                    encode(k);
+                    encode(val[k]);
+                });
+                return;
+            }
+        };
+
+        encode(data);
+        return buffer.subarray(0, offset);
+    }
+
+    function deserialize(input) {
+        if (input instanceof ArrayBuffer) input = new Uint8Array(input);
+        if (!(input instanceof Uint8Array)) throw new Error("Expected Uint8Array");
+        let pos = 0;
+
+        const read = () => input[pos++];
+
+        const readN = (n) => {
+            const out = input.subarray(pos, pos + n);
+            pos += n;
+            return out;
+        };
+
+        const readUint = (n) => {
+            let val = 0;
+            for (let i = 0; i < n; i++) val = (val << 8) | read();
+            return val >>> 0;
+        };
+
+        const readInt = (n) => {
+            let val = read();
+            if (val & 0x80) val -= 0x100;
+            for (let i = 1; i < n; i++) val = (val << 8) | read();
+            return val;
+        };
+
+        const readFloat = (n) => {
+            const view = new DataView(input.buffer, input.byteOffset + pos, n);
+            pos += n;
+            return n === 4 ? view.getFloat32(0, false) : view.getFloat64(0, false);
+        };
+
+        const decode = () => {
+            const byte = read();
+            if (byte <= 0x7f) return byte;
+            if (byte >= 0xe0) return byte - 256;
+            if (byte >= 0xa0 && byte <= 0xbf) return decodeUtf8(input, pos, byte - 0xa0), pos += (byte - 0xa0), decodeUtf8(input, pos - (byte - 0xa0), byte - 0xa0);
+            if (byte >= 0x90 && byte <= 0x9f) {
+                const len = byte - 0x90;
+                return Array.from({ length: len }, () => decode());
+            }
+            if (byte >= 0x80 && byte <= 0x8f) {
+                const len = byte - 0x80;
+                const obj = {};
+                for (let i = 0; i < len; i++) {
+                    const key = decode();
+                    obj[key] = decode();
+                }
+                return obj;
+            }
+
+            switch (byte) {
+                case 0xc0: return null;
+                case 0xc2: return false;
+                case 0xc3: return true;
+                case 0xcc: return read();
+                case 0xcd: return readUint(2);
+                case 0xce: return readUint(4);
+                case 0xd0: return readInt(1);
+                case 0xd1: return readInt(2);
+                case 0xd2: return readInt(4);
+                case 0xca: return readFloat(4);
+                case 0xcb: return readFloat(8);
+                case 0xd9: return decodeUtf8(input, pos + 1, input[pos++]);
+                case 0xda: {
+                    const len = readUint(2);
+                    const str = decodeUtf8(input, pos, len);
+                    pos += len;
+                    return str;
+                }
+                case 0xdc: {
+                    const len = readUint(2);
+                    return Array.from({ length: len }, () => decode());
+                }
+                case 0xde: {
+                    const len = readUint(2);
+                    const obj = {};
+                    for (let i = 0; i < len; i++) obj[decode()] = decode();
+                    return obj;
+                }
+                case 0xd6: {
+                    read(); // ext type
+                    const sec = readUint(4);
+                    return new Date(sec * 1000);
+                }
+                case 0xcf: {
+                    const hi = readUint(4);
+                    const lo = readUint(4);
+                    return hi * pow32 + lo;
+                }
+                case 0xd3: {
+                    const hi = readInt(4);
+                    const lo = readUint(4);
+                    return hi * pow32 + lo;
+                }
+            }
+
+            throw new Error("Unsupported byte: " + byte.toString(16));
+        };
+
+        return decode();
+    }
+
+    return {
+        serialize,
+        deserialize,
+        encode: serialize,
+        decode: deserialize
+    };
+})();
